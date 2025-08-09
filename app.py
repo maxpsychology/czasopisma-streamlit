@@ -9,8 +9,8 @@ st.title("🔎 Wyszukiwarka czasopism (lista MEiN 2024) — wersja z Excelem")
 st.markdown("""
 Ta wersja **czyta bezpośrednio plik Excel (.xlsx)** w układzie jak w MEiN 2024.
 Możesz skorzystać z jednej z opcji:
-1) **Plik lokalny w repo** – domyślnie: `wykaz_mein_2024.xlsx` w katalogu aplikacji.  
-2) **Wgraj własny plik** (xlsx lub csv).  
+1) **Plik lokalny w repo** – domyślnie: `wykaz_mein_2024.xlsx` w katalogu aplikacji.
+2) **Wgraj własny plik** (xlsx lub csv).
 3) **Podaj adres URL** do pliku (np. RAW z GitHuba).
 """)
 
@@ -29,17 +29,15 @@ def read_mein_excel(file_like):
     disc_cols = df.columns[start_idx:]
     code_to_name = {codes_row[i]: names_row[i] for i in range(len(disc_cols))}
 
-    def extract_disciplines(row):
-        out = []
-        for code in disc_cols:
-            if str(row.get(code, "")).strip().lower() == 'x':
-                out.append(code_to_name.get(code, str(code)))
-        return ", ".join(out)
-
-    df['Dyscypliny'] = df.apply(extract_disciplines, axis=1)
+    # Wektoryzowane oznaczanie dyscyplin zamiast pętli po każdej komórce
+    disc_mask = df[disc_cols].fillna("").apply(lambda col: col.astype(str).str.strip().str.lower() == "x")
+    df["Dyscypliny_list"] = disc_mask.apply(
+        lambda row: [code_to_name[c] for c in row.index[row]], axis=1
+    )
+    df["Dyscypliny"] = df["Dyscypliny_list"].apply(lambda lst: ", ".join(lst))
 
     # Zachowaj kluczowe kolumny i porządki
-    keep = ["Tytuł 1","Tytuł 2","issn","e-issn","Punktacja","Dyscypliny"]
+    keep = ["Tytuł 1","Tytuł 2","issn","e-issn","Punktacja","Dyscypliny","Dyscypliny_list"]
     df = df[keep].copy()
 
     # Poradź sobie z potencjalnymi duplikatami nazw kolumn w źródle
@@ -67,25 +65,36 @@ def read_any(file):
     if isinstance(file, str) and file.startswith(("http://","https://")):
         # URL (np. RAW GitHub) — pandas obsłuży
         if file.lower().endswith(".csv"):
-            return pd.read_csv(file)
-        # xlsx
-        return read_mein_excel(file)
+            df = pd.read_csv(file)
+        else:  # xlsx
+            df = read_mein_excel(file)
+        return _ensure_lists(df)
 
     # Lokalny upload (UploadedFile)
     name = getattr(file, "name", "")
     if name.endswith(".csv"):
-        return pd.read_csv(file)
+        return _ensure_lists(pd.read_csv(file))
     if name.endswith(".xlsx"):
         return read_mein_excel(file)
 
     # Ścieżka lokalna
     if isinstance(file, str):
         if file.lower().endswith(".csv"):
-            return pd.read_csv(file)
+            return _ensure_lists(pd.read_csv(file))
         if file.lower().endswith(".xlsx"):
             return read_mein_excel(file)
 
     raise ValueError("Nieobsługiwany format lub brak pliku.")
+
+
+def _ensure_lists(df: pd.DataFrame) -> pd.DataFrame:
+    """Upewnij się, że istnieje kolumna `Dyscypliny_list`.
+    Przy wczytywaniu z CSV może jej brakować."""
+    if "Dyscypliny_list" not in df.columns and "Dyscypliny" in df.columns:
+        df["Dyscypliny_list"] = df["Dyscypliny"].apply(
+            lambda s: [x.strip() for x in str(s).split(",") if x and str(x).strip()]
+        )
+    return df
 
 # Panel boczny: wybór źródła
 with st.sidebar:
@@ -109,30 +118,22 @@ with st.sidebar:
             st.stop()
         df = read_any(url)
 
-# Przygotowanie listy dyscyplin
-def split_disciplines(s):
-    if pd.isna(s):
-        return []
-    return [x.strip() for x in str(s).split(",") if x and str(x).strip()]
+all_disciplines = sorted({d for row in df["Dyscypliny_list"] for d in row})
 
-all_disciplines = sorted({d for row in df["Dyscypliny"].apply(split_disciplines) for d in row})
+# Filtry w głównym obszarze aplikacji
+with st.expander("Filtry", expanded=True):
+    col1, col2, col3 = st.columns([2, 2, 1])
+    title_query = col1.text_input(
+        "Szukaj w tytule", placeholder="np. psychology, management..."
+    )
+    selected = col2.multiselect("Dyscypliny", options=all_disciplines)
 
-# Filtry
-with st.sidebar:
-    st.header("Filtry")
-    title_query = st.text_input("Szukaj w tytule", placeholder="np. psychology, management...")
-    st.markdown("**Dyscypliny**")
-    selected = []
-    cols = st.columns(2)
-    for i, d in enumerate(all_disciplines):
-        if cols[i % 2].checkbox(d, value=False, key=f"disc_{i}"):
-            selected.append(d)
-
-    # Suwak punktacji
-    min_p = int(pd.to_numeric(df["Punktacja"], errors="coerce").dropna().min())
-    max_p = int(pd.to_numeric(df["Punktacja"], errors="coerce").dropna().max())
+    min_p = int(df["Punktacja"].min())
+    max_p = int(df["Punktacja"].max())
     step = 10 if (max_p - min_p) >= 10 else 1
-    points = st.slider("Punktacja (zakres)", min_value=min_p, max_value=max_p, value=(min_p, max_p), step=step)
+    points = col3.slider(
+        "Punktacja", min_value=min_p, max_value=max_p, value=(min_p, max_p), step=step
+    )
 
 # Filtrowanie
 f = df.copy()
@@ -145,16 +146,17 @@ if title_query:
     f = f[mask]
 
 if selected:
-    f = f[f["Dyscypliny"].apply(lambda s: any(d in s for d in selected))]
+    sel = set(selected)
+    f = f[f["Dyscypliny_list"].apply(lambda lst: bool(sel.intersection(lst)))]
 
 f = f[(f["Punktacja"] >= points[0]) & (f["Punktacja"] <= points[1])]
 
 st.success(f"Znaleziono {len(f):,} pozycji")
 
-st.dataframe(f, use_container_width=True, height=600)
+st.dataframe(f.drop(columns=["Dyscypliny_list"]), use_container_width=True, height=600)
 
 # Pobieranie wyników
-csv = f.to_csv(index=False).encode("utf-8-sig")
+csv = f.drop(columns=["Dyscypliny_list"]).to_csv(index=False).encode("utf-8-sig")
 st.download_button("📥 Pobierz wyniki (CSV)", data=csv, file_name="wyniki_czasopisma.csv", mime="text/csv")
 
 st.markdown("---")
